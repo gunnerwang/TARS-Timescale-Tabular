@@ -1,0 +1,976 @@
+import os
+import shutil
+import time
+import errno
+import pprint
+import torch
+import numpy as np
+import random
+import json
+import os.path as osp
+
+
+THIS_PATH = os.path.dirname(__file__)
+
+def mkdir(path):
+    """
+    Create a directory if it does not exist.
+
+    :path: str, path to the directory
+    """
+    try:
+        os.makedirs(path)
+    except OSError as exc:  # Python >2.5
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+def set_gpu(x):
+    """
+    Set environment variable CUDA_VISIBLE_DEVICES
+    
+    :x: str, GPU id
+    """
+    os.environ['CUDA_VISIBLE_DEVICES'] = x
+    print('using gpu:', x)
+
+
+def ensure_path(path, remove=True):
+    """
+    Ensure a path exists.
+
+    path: str, path to the directory
+    remove: bool, whether to remove the directory if it exists
+    """
+    if os.path.exists(path):
+        if remove:
+            if input('{} exists, remove? ([y]/n)'.format(path)) != 'n':
+                shutil.rmtree(path)
+                os.mkdir(path)
+    else:
+        os.mkdir(path)
+
+
+#  --- criteria helper ---
+class Averager():
+    """
+    A simple averager.
+
+    """
+    def __init__(self):
+        self.n = 0
+        self.v = 0
+
+    def add(self, x):
+        """
+        
+        :x: float, value to be added
+        """
+        self.v = (self.v * self.n + x) / (self.n + 1)
+        self.n += 1
+
+    def item(self):
+        return self.v
+
+class Timer():
+
+    def __init__(self):
+        self.o = time.time()
+
+    def measure(self, p=1):
+        """
+        Measure the time since the last call to measure.
+
+        :p: int, period of printing the time
+        """
+
+        x = (time.time() - self.o) / p
+        x = int(x)
+        if x >= 3600:
+            return '{:.1f}h'.format(x / 3600)
+        if x >= 60:
+            return '{}m'.format(round(x / 60))
+        return '{}s'.format(x)
+
+_utils_pp = pprint.PrettyPrinter()
+def pprint(x):
+    _utils_pp.pprint(x)
+
+#  ---- import from lib.util -----------
+def set_seeds(base_seed: int, one_cuda_seed: bool = False) -> None:
+    """
+    Set random seeds for reproducibility.
+
+    :base_seed: int, base seed
+    :one_cuda_seed: bool, whether to set one seed for all GPUs
+    """
+    assert 0 <= base_seed < 2 ** 32 - 10000
+    random.seed(base_seed)
+    np.random.seed(base_seed + 1)
+    torch.manual_seed(base_seed + 2)
+    cuda_seed = base_seed + 3
+    if one_cuda_seed:
+        torch.cuda.manual_seed_all(cuda_seed)
+    elif torch.cuda.is_available():
+        # the following check should never succeed since torch.manual_seed also calls
+        # torch.cuda.manual_seed_all() inside; but let's keep it just in case
+        if not torch.cuda.is_initialized():
+            torch.cuda.init()
+        # Source: https://github.com/pytorch/pytorch/blob/2f68878a055d7f1064dded1afac05bb2cb11548f/torch/cuda/random.py#L109
+        for i in range(torch.cuda.device_count()):
+            default_generator = torch.cuda.default_generators[i]
+            default_generator.manual_seed(cuda_seed + i)
+
+def get_device() -> torch.device:
+    return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+import sklearn.metrics as skm
+def rmse(y, prediction, y_info):
+    """
+    
+    :y: np.ndarray, ground truth
+    :prediction: np.ndarray, prediction
+    :y_info: dict, information about the target variable
+    :return: float, root mean squared error
+    """
+    rmse = skm.mean_squared_error(y, prediction) ** 0.5  # type: ignore[code]
+    if y_info['policy'] == 'mean_std':
+        rmse *= y_info['std']
+    return rmse
+    
+def load_config(args, config=None, config_name=None):
+    """
+    Load the config file.
+
+    :args: argparse.Namespace, arguments
+    :config: dict, config file
+    :config_name: str, name of the config file
+    :return: argparse.Namespace, arguments
+    """
+    if config is None:
+        config_path = os.path.join(os.path.abspath(os.path.join(THIS_PATH, '..')), 
+                                   'configs', args.dataset, 
+                                   '{}.json'.format(args.model_type if args.config_name is None else args.config_name))
+        with open(config_path, 'r') as fp:
+            config = json.load(fp)
+
+    # set additional parameters
+    args.config = config 
+
+    # save the config files
+    with open(os.path.join(args.save_path, 
+                           '{}.json'.format('config' if config_name is None else config_name)), 'w') as fp:
+        args_dict = vars(args)
+        if 'device' in args_dict:
+            del args_dict['device']
+        json.dump(args_dict, fp, sort_keys=True, indent=4)
+
+    return args
+
+# parameter search
+def sample_parameters(trial, space, base_config):
+    """
+    Sample hyper-parameters.
+
+    :trial: optuna.trial.Trial, trial
+    :space: dict, search space
+    :base_config: dict, base configuration
+    :return: dict, sampled hyper-parameters
+    """
+    def get_distribution(distribution_name):
+        return getattr(trial, f'suggest_{distribution_name}')
+
+    result = {}
+    for label, subspace in space.items():
+        if isinstance(subspace, dict):
+            result[label] = sample_parameters(trial, subspace, base_config)
+        else:
+            assert isinstance(subspace, list)
+            distribution, *args = subspace
+
+            if distribution.startswith('?'):
+                default_value = args[0]
+                result[label] = (
+                    get_distribution(distribution.lstrip('?'))(label, *args[1:])
+                    if trial.suggest_categorical(f'optional_{label}', [False, True])
+                    else default_value
+                )
+
+            elif distribution == '$mlp_d_layers':  # tuning [d_first, d_middle * n, d_last]
+                assert len(args) == 4
+                min_n_layers, max_n_layers, d_min, d_max = args
+                n_layers = trial.suggest_int('n_layers', min_n_layers, max_n_layers)
+                suggest_dim = lambda name: trial.suggest_int(name, d_min, d_max)  # noqa
+                d_first = [suggest_dim('d_first')] if n_layers else []
+                d_middle = (
+                    [suggest_dim('d_middle')] * (n_layers - 2) if n_layers > 2 else []
+                )
+                d_last = [suggest_dim('d_last')] if n_layers > 1 else []
+                result[label] = d_first + d_middle + d_last
+
+            elif distribution == '$d_token':
+                assert len(args) == 2
+                try:
+                    n_heads = base_config['model']['n_heads']
+                except KeyError:
+                    n_heads = base_config['model']['n_latent_heads']
+
+                for x in args:
+                    assert x % n_heads == 0
+                result[label] = trial.suggest_int('d_token', *args, n_heads)  # type: ignore[code]
+
+            elif distribution in ['$d_ffn_factor', '$d_hidden_factor']:
+                if base_config['model']['activation'].endswith('glu'):
+                    args = (args[0] * 2 / 3, args[1] * 2 / 3)
+                result[label] = trial.suggest_uniform('d_ffn_factor', *args)
+            
+            elif distribution == '$power_int':
+                assert len(args) == 2
+                min_int, max_int = args
+                log_int = trial.suggest_int(f'log_{label}', min_int, max_int)
+                result[label] = 2 ** log_int
+            
+            elif distribution == '$?power_int':
+                assert len(args) == 3
+                default_value, min_log, max_log = args
+                if trial.suggest_categorical(f'optional_{label}', [False, True]):
+                    log_int = trial.suggest_int(f'log_{label}', min_log, max_log)
+                    result[label] = 2 ** log_int
+                else:
+                    result[label] = default_value
+                
+            elif distribution == '$step_int':
+                assert len(args) == 3
+                min_int, max_int, step = args
+                result[label] = trial.suggest_int(f'{label}', min_int, max_int, step)
+                
+            elif distribution == '$power_d_layers':  # tuning [d_first, d_middle * n, d_last] in log
+                assert len(args) == 4
+                min_n_layers, max_n_layers, log_d_min, log_d_max = args
+                n_layers = trial.suggest_int('n_layers', min_n_layers, max_n_layers)
+                suggest_dim = lambda name: trial.suggest_int(name, log_d_min, log_d_max)  # noqa
+                d_first = [suggest_dim('log_d_first')] if n_layers else []
+                d_middle = (
+                    [suggest_dim('log_d_middle')] * (n_layers - 2) if n_layers > 2 else []
+                )
+                d_last = [suggest_dim('log_d_last')] if n_layers > 1 else []
+                log_d_layers = d_first + d_middle + d_last
+                result[label] = [2 ** d for d in log_d_layers]
+            
+            elif distribution == '$temporal_order':  # tuning [order * n], order in [?int, 0, power_int[log_min, log_max]]
+                assert len(args) == 3
+                n_order, log_min, log_max = args
+                suggest_order = lambda name: trial.suggest_int(name, log_min, log_max)
+                result[label] = []
+                for i in range(n_order):
+                    if trial.suggest_categorical(f'optional_order_{i}', [False, True]):
+                        result[label].append(2 ** suggest_order(f'log_order_{i}'))
+                    else:
+                        result[label].append(0)
+                
+            else:
+                result[label] = get_distribution(distribution)(label, *args)
+    return result
+
+def merge_sampled_parameters(config, sampled_parameters):
+    """
+    Merge the sampled hyper-parameters.
+
+    :config: dict, configuration
+    :sampled_parameters: dict, sampled hyper-parameters
+    """
+    for k, v in sampled_parameters.items():
+        if isinstance(v, dict):
+            merge_sampled_parameters(config.setdefault(k, {}), v)
+        else:
+            # If there are parameters in the default config, the value of the parameter will be overwritten.
+            config[k] = v
+
+def get_classical_args():
+    """
+    Get the arguments for classical models.
+
+    :return: argparse.Namespace, arguments
+    """
+
+    import argparse
+    import warnings
+    warnings.filterwarnings("ignore")
+    with open('configs/classical_configs.json','r') as file:
+        default_args = json.load(file)
+    parser = argparse.ArgumentParser()
+    # basic parameters
+    parser.add_argument('--dataset', type=str, default=default_args['dataset'])
+    parser.add_argument('--model_type', type=str,
+                        default=default_args['model_type'],
+                        choices=['xgboost', 'catboost', 'lightgbm',
+                                 'RandomForest', 'SGD',
+                                 ])
+    
+    # dataset parameters for time series
+    parser.add_argument('--enable_timestamp', action='store_true', default=default_args['enable_timestamp'])
+    parser.add_argument('--validate_option', type=str, default=default_args['validate_option'], choices=[
+        'holdout_last', 'holdout_foremost', 'holdout_last_drop_foremost', 'holdout_foremost_drop_last', 
+        'holdout_foremost_bias_lag', 'holdout_foremost_nobias_lag', 'holdout_foremost_bias_nolag', 'holdout_foremost_nobias_nolag', 
+        'holdout_foremost_sample', 'holdout_last_nobias_lag_sample', 'holdout_last_bias_lag_sample', 'holdout_last_nobias_nolag_sample', 'holdout_last_nobias_nolag_reverse_sample', 
+        'holdout_random_0', 'holdout_random_1', 'holdout_random_2', 
+        'temporal_cross_validation'])
+    parser.add_argument('--dataset_path_tabred', type=str, default=default_args['dataset_path_tabred'])
+    parser.add_argument('--hpo_timeout', type=int, default=default_args['hpo_timeout'])
+    
+    # optimization parameters 
+    parser.add_argument('--normalization', type=str, default=default_args['normalization'], choices=['none', 'standard', 'minmax', 'quantile', 'maxabs', 'power', 'robust'])
+    parser.add_argument('--num_nan_policy', type=str, default=default_args['num_nan_policy'], choices=['mean', 'median'])
+    parser.add_argument('--cat_nan_policy', type=str, default=default_args['cat_nan_policy'], choices=['new', 'most_frequent'])
+    parser.add_argument('--cat_policy', type=str, default=default_args['cat_policy'], choices=['indices', 'ordinal', 'ohe', 'binary', 'hash', 'loo', 'target', 'catboost'])
+    parser.add_argument('--num_policy',type=str, default=default_args['num_policy'], choices=['none','Q_PLE','T_PLE','Q_Unary','T_Unary','Q_bins','T_bins','Q_Johnson','T_Johnson'])
+    parser.add_argument('--temporal_policy', type=str, default=default_args['temporal_policy'], choices=['indices', 'num', 'time_num'])
+    
+    parser.add_argument('--n_bins', type=int, default=default_args['n_bins'])
+    parser.add_argument('--cat_min_frequency', type=float, default=default_args['cat_min_frequency'])
+
+    # other choices
+    parser.add_argument('--n_trials', type=int, default=default_args['n_trials'])    
+    parser.add_argument('--seed_num', type=int, default=default_args['seed_num'])
+    parser.add_argument('--gpu', default=default_args['gpu'])
+    parser.add_argument('--tune', action='store_true', default=default_args['tune'])  
+    parser.add_argument('--retune', action='store_true', default=default_args['retune'])  
+    parser.add_argument('--dataset_path', type=str, default=default_args['dataset_path'])  
+    parser.add_argument('--model_path', type=str, default=default_args['model_path'])
+    parser.add_argument('--evaluate_option', type=str, default=default_args['evaluate_option'])
+    parser.add_argument('--experiment_tag', type=str, default=default_args['experiment_tag'], help='Additional tag for experiment identification (e.g., "multi-timescale drift-aware")')
+    args = parser.parse_args()
+    
+    set_gpu(args.gpu)
+    save_path1 = '-'.join([args.dataset, args.model_type])
+    save_path2 = 'Norm-{}'.format(args.normalization)
+    save_path2 += '-Nan-{}-{}'.format(args.num_nan_policy, args.cat_nan_policy)
+    save_path2 += '-Cat-{}'.format(args.cat_policy)
+    save_path2 += '-{}'.format(args.validate_option)
+
+    if args.enable_timestamp and args.temporal_policy != 'indices':
+        save_path2 += '-Temp-{}'.format(args.temporal_policy)
+    if args.cat_min_frequency > 0.0:
+        save_path2 += '-CatFreq-{}'.format(args.cat_min_frequency)
+    if args.tune:
+        save_path1 += '-Tune'
+    if args.experiment_tag:
+        save_path1 += '-{}'.format(args.experiment_tag.replace(' ', '_'))
+
+    save_path = osp.join(save_path1, save_path2)
+    args.save_path = osp.join(args.model_path, save_path)
+    mkdir(args.save_path)    
+    
+    # load config parameters
+    args.seed = 0
+    
+    config_default_path = os.path.join('configs','default',args.model_type+'.json')
+    config_opt_path = os.path.join('configs','opt_space',args.model_type+'.json')
+    with open(config_default_path,'r') as file:
+        default_para = json.load(file)  
+    
+    with open(config_opt_path,'r') as file:
+        opt_space = json.load(file)
+
+    args.config = default_para[args.model_type]
+    set_seeds(args.seed)
+    if torch.cuda.is_available():     
+        torch.backends.cudnn.benchmark = True
+    pprint(vars(args))
+    
+    args.config['fit']['n_bins'] = args.n_bins
+    return args,default_para,opt_space   
+
+def get_deep_args():  
+    """
+    Get the arguments for deep learning models.
+
+    :return: argparse.Namespace, arguments
+    """
+    import argparse 
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    parser = argparse.ArgumentParser()
+    # basic parameters
+    with open('configs/deep_configs.json','r') as file:
+        default_args = json.load(file)
+    parser.add_argument('--dataset', type=str, default=default_args['dataset'])
+    parser.add_argument('--model_type', type=str,
+                        default=default_args['model_type'],
+                        choices=['mlp', 'mlp_temporal', 'mlp_plr', 'mlp_plr_temporal',
+                                 'snn', 'snn_temporal', 'dcn2', 'dcn2_temporal',
+                                 'ftt', 'ftt_temporal', 'tabr', 'tabr_temporal',
+                                 'modernNCA', 'modernNCA_temporal', 'tabm', 'tabm_temporal',
+                                 'mlp_modulated', 'tabm_modulated',
+                                 ])
+    
+    # dataset parameters for time series
+    parser.add_argument('--enable_timestamp', action='store_true', default=default_args['enable_timestamp'])
+    parser.add_argument('--validate_option', type=str, default=default_args['validate_option'], choices=[
+        'holdout_last', 'holdout_foremost', 'holdout_last_drop_foremost', 'holdout_foremost_drop_last', 
+        'holdout_foremost_bias_lag', 'holdout_foremost_nobias_lag', 'holdout_foremost_bias_nolag', 'holdout_foremost_nobias_nolag', 
+        'holdout_foremost_sample', 'holdout_last_nobias_lag_sample', 'holdout_last_bias_lag_sample', 'holdout_last_nobias_nolag_sample', 'holdout_last_nobias_nolag_reverse_sample', 
+        'holdout_random_0', 'holdout_random_1', 'holdout_random_2', 
+        'temporal_cross_validation'])
+    parser.add_argument('--early_stopping', type=int, default=default_args['early_stopping'])
+    parser.add_argument('--dataset_path_tabred', type=str, default=default_args['dataset_path_tabred'])
+    parser.add_argument('--hpo_timeout', type=int, default=default_args['hpo_timeout'])
+    
+    # optimization parameters
+    parser.add_argument('--max_epoch', type=int, default=default_args['max_epoch'])
+    parser.add_argument('--batch_size', type=int, default=default_args['batch_size'])
+    parser.add_argument('--normalization', type=str, default=default_args['normalization'], choices=['none', 'standard', 'minmax', 'quantile', 'maxabs', 'power', 'robust'])
+    parser.add_argument('--num_nan_policy', type=str, default=default_args['num_nan_policy'], choices=['mean', 'median'])
+    parser.add_argument('--cat_nan_policy', type=str, default=default_args['cat_nan_policy'], choices=['new', 'most_frequent'])
+    parser.add_argument('--cat_policy', type=str, default=default_args['cat_policy'], choices=['indices', 'ordinal', 'ohe', 'binary', 'hash', 'loo', 'target', 'catboost','tabr_ohe'])
+    parser.add_argument('--num_policy',type=str, default=default_args['num_policy'], choices=['none','Q_PLE','T_PLE','Q_Unary','T_Unary','Q_bins','T_bins','Q_Johnson','T_Johnson'])
+    parser.add_argument('--temporal_policy', type=str, default=default_args['temporal_policy'], choices=['indices', 'num', 'time_num', 'time_series'])
+    
+    # optimizer parameters
+    parser.add_argument('--optimizer_type', type=str, default=default_args['optimizer_type'], choices=['adamw', 'soft_resets'], help='Type of optimizer to use')
+    parser.add_argument('--soft_resets_config', type=str, default=default_args['soft_resets_config'], choices=['standard', 'aggressive', 'conservative', 'bayesian'], help='Configuration preset for SoftResets optimizer')
+    
+    parser.add_argument('--n_bins', type=int, default=default_args['n_bins'])
+    parser.add_argument('--cat_min_frequency', type=float, default=default_args['cat_min_frequency'])
+
+    # other choices
+    parser.add_argument('--n_trials', type=int, default=default_args['n_trials'])
+    parser.add_argument('--seed_num', type=int, default=default_args['seed_num'])
+    parser.add_argument('--workers', type=int, default=default_args['workers'])
+    parser.add_argument('--gpu', default=default_args['gpu'])
+    parser.add_argument('--tune', action='store_true', default=default_args['tune'])
+    parser.add_argument('--retune', action='store_true', default=default_args['retune'])
+    parser.add_argument('--evaluate_option', type=str, default=default_args['evaluate_option'])
+    parser.add_argument('--dataset_path', type=str, default=default_args['dataset_path'])
+    parser.add_argument('--model_path', type=str, default=default_args['model_path'])
+    parser.add_argument('--experiment_tag', type=str, default=default_args['experiment_tag'], help='Additional tag for experiment identification (e.g., "multi-timescale drift-aware")')
+    args = parser.parse_args()
+    
+    set_gpu(args.gpu)
+    save_path1 = '-'.join([args.dataset, args.model_type])
+    save_path2 = 'Epoch{}BZ{}'.format(args.max_epoch, args.batch_size)
+    save_path2 += '-Norm-{}'.format(args.normalization)
+    save_path2 += '-Nan-{}-{}'.format(args.num_nan_policy, args.cat_nan_policy)
+    save_path2 += '-Cat-{}'.format(args.cat_policy)
+    save_path2 += '-{}'.format(args.validate_option)
+    
+    if args.enable_timestamp and args.temporal_policy != 'indices':
+        save_path2 += '-Temp-{}'.format(args.temporal_policy)
+    if args.cat_min_frequency > 0.0:
+        save_path2 += '-CatFreq-{}'.format(args.cat_min_frequency)
+    if args.optimizer_type != 'adamw':
+        save_path2 += '-Opt-{}'.format(args.optimizer_type)
+        if args.optimizer_type == 'soft_resets':
+            save_path2 += '-{}'.format(args.soft_resets_config)
+    if args.tune:
+        save_path1 += '-Tune'
+    if args.experiment_tag:
+        save_path1 += '-{}'.format(args.experiment_tag.replace(' ', '_'))
+
+    save_path = osp.join(save_path1, save_path2)
+    args.save_path = osp.join(args.model_path, save_path)
+    mkdir(args.save_path)    
+    
+    # load config parameters
+    config_default_path = os.path.join('configs','default',args.model_type+'.json')
+    config_opt_path = os.path.join('configs','opt_space',args.model_type+'.json')
+    with open(config_default_path,'r') as file:
+        default_para = json.load(file)  
+    
+    with open(config_opt_path,'r') as file:
+        opt_space = json.load(file)
+    args.config = default_para[args.model_type]
+    
+    args.seed = 0
+    set_seeds(args.seed)
+    if torch.cuda.is_available():     
+        torch.backends.cudnn.benchmark = True
+    pprint(vars(args))
+    
+    args.config['training']['n_bins'] = args.n_bins
+    return args,default_para,opt_space   
+
+def show_results_classical(args,info,metric_name,results_list,time_list):
+    """
+    Show the results for classical models.
+
+    :args: argparse.Namespace, arguments
+    :info: dict, information about the dataset
+    :metric_name: list, names of the metrics
+    :results_list: list, list of results
+    :time_list: list, list of time
+    """
+    metric_arrays = {name: [] for name in metric_name}  
+
+
+    for result in results_list:
+        for idx, name in enumerate(metric_name):
+            metric_arrays[name].append(result[idx])
+
+    metric_arrays['Time'] = time_list
+    metric_name = metric_name + ('Time', )
+
+    mean_metrics = {name: np.mean(metric_arrays[name]) for name in metric_name}
+    std_metrics = {name: np.std(metric_arrays[name]) for name in metric_name}
+    
+
+    # Printing results
+    print(f'{args.model_type}: {args.seed_num} Trials')
+    for name in metric_name:
+        if info['task_type'] == 'regression' and name != 'Time':
+            formatted_results = ', '.join(['{:.8e}'.format(e) for e in metric_arrays[name]])
+            print(f'{name} Results: {formatted_results}')
+            print(f'{name} MEAN = {mean_metrics[name]:.8e} ± {std_metrics[name]:.8e}')
+        else:
+            formatted_results = ', '.join(['{:.8f}'.format(e) for e in metric_arrays[name]])
+            print(f'{name} Results: {formatted_results}')
+            print(f'{name} MEAN = {mean_metrics[name]:.8f} ± {std_metrics[name]:.8f}')
+
+    # Save results to JSON file
+    test_metrics_file = osp.join(args.save_path, 'test_metrics.json')
+    
+    # Create metrics dictionary
+    test_metrics = {
+        'model_type': args.model_type,
+        'trials': args.seed_num,
+        'metrics': {}
+    }
+    
+    # Add individual trial results
+    test_metrics['trials_data'] = []
+    for i in range(len(results_list)):
+        trial_data = {'trial': i}
+        for idx, name in enumerate(metric_name[:-1]):  # Exclude Time which we added
+            trial_data[name] = float(results_list[i][idx])
+        trial_data['Time'] = float(time_list[i])
+        test_metrics['trials_data'].append(trial_data)
+    
+    # Add summary statistics
+    for name in metric_name:
+        test_metrics['metrics'][name] = {
+            'mean': float(mean_metrics[name]),
+            'std': float(std_metrics[name]),
+            'values': [float(val) for val in metric_arrays[name]]
+        }
+    
+    # Add dataset and configuration info
+    test_metrics['dataset_info'] = {
+        'dataset': args.dataset,
+        'task_type': info['task_type']
+    }
+    
+    # Add configuration parameters
+    config_params = {}
+    for key in vars(args):
+        value = getattr(args, key)
+        # Skip complex objects that aren't JSON serializable
+        if not isinstance(value, (dict, list, tuple, str, int, float, bool, type(None))) or callable(value):
+            continue
+        # For dictionaries, ensure they're serializable
+        if isinstance(value, dict):
+            try:
+                json.dumps(value)
+                config_params[key] = value
+            except:
+                continue
+        else:
+            config_params[key] = value
+    
+    test_metrics['config'] = config_params
+    
+    # Save to file
+    with open(test_metrics_file, 'w') as f:
+        json.dump(test_metrics, f, indent=4)
+    
+    print(f"Test metrics saved to {test_metrics_file}")
+
+    print('-' * 20, 'GPU info', '-' * 20)
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"{num_gpus} GPU Available.")
+        for i in range(num_gpus):
+            gpu_info = torch.cuda.get_device_properties(i)
+            print(f"GPU {i}: {gpu_info.name}")
+            print(f"  Total Memory:          {gpu_info.total_memory / 1024**2} MB")
+            print(f"  Multi Processor Count: {gpu_info.multi_processor_count}")
+            print(f"  Compute Capability:    {gpu_info.major}.{gpu_info.minor}")
+    else:
+        print("CUDA is unavailable.")
+    print('-' * 50)
+
+
+
+def show_results(args,info,metric_name,loss_list,results_list,time_list):
+    """
+    Show the results for deep learning models.
+
+    :args: argparse.Namespace, arguments
+    :info: dict, information about the dataset
+    :metric_name: list, names of the metrics
+    :loss_list: list, list of loss
+    :results_list: list, list of results
+    :time_list: list, list of time
+    """
+    metric_arrays = {name: [] for name in metric_name}  
+
+
+    for result in results_list:
+        for idx, name in enumerate(metric_name):
+            metric_arrays[name].append(result[idx])
+
+    metric_arrays['Time'] = time_list
+    metric_name = metric_name + ('Time', )
+
+    mean_metrics = {name: np.mean(metric_arrays[name]) for name in metric_name}
+    std_metrics = {name: np.std(metric_arrays[name]) for name in metric_name}
+    mean_loss = np.mean(np.array(loss_list)) if loss_list else None
+
+    # Printing results
+    print(f'{args.model_type}: {args.seed_num} Trials')
+    for name in metric_name:
+        if info['task_type'] == 'regression' and name != 'Time':
+            formatted_results = ', '.join(['{:.8e}'.format(e) for e in metric_arrays[name]])
+            print(f'{name} Results: {formatted_results}')
+            print(f'{name} MEAN = {mean_metrics[name]:.8e} ± {std_metrics[name]:.8e}')
+        else:
+            formatted_results = ', '.join(['{:.8f}'.format(e) for e in metric_arrays[name]])
+            print(f'{name} Results: {formatted_results}')
+            print(f'{name} MEAN = {mean_metrics[name]:.8f} ± {std_metrics[name]:.8f}')
+
+    if loss_list:
+        print(f'Mean Loss: {mean_loss:.8e}')
+    
+    # Save results to JSON file
+    test_metrics_file = osp.join(args.save_path, 'test_metrics.json')
+    
+    # Create metrics dictionary
+    test_metrics = {
+        'model_type': args.model_type,
+        'trials': args.seed_num,
+        'metrics': {}
+    }
+    
+    # Add individual trial results
+    test_metrics['trials_data'] = []
+    for i in range(len(results_list)):
+        trial_data = {'trial': i}
+        for idx, name in enumerate(metric_name[:-1]):  # Exclude Time which we added
+            trial_data[name] = float(results_list[i][idx])
+        trial_data['Time'] = float(time_list[i])
+        if loss_list:
+            trial_data['Loss'] = float(loss_list[i]) if i < len(loss_list) else None
+        test_metrics['trials_data'].append(trial_data)
+    
+    # Add summary statistics
+    for name in metric_name:
+        test_metrics['metrics'][name] = {
+            'mean': float(mean_metrics[name]),
+            'std': float(std_metrics[name]),
+            'values': [float(val) for val in metric_arrays[name]]
+        }
+    
+    if loss_list:
+        test_metrics['metrics']['Loss'] = {
+            'mean': float(mean_loss),
+            'std': float(np.std(np.array(loss_list))),
+            'values': [float(val) for val in loss_list]
+        }
+    
+    # Add dataset and configuration info
+    test_metrics['dataset_info'] = {
+        'dataset': args.dataset,
+        'task_type': info['task_type']
+    }
+    
+    # Add configuration parameters
+    config_params = {}
+    for key in vars(args):
+        value = getattr(args, key)
+        # Skip complex objects that aren't JSON serializable
+        if not isinstance(value, (dict, list, tuple, str, int, float, bool, type(None))) or callable(value):
+            continue
+        # For dictionaries, ensure they're serializable
+        if isinstance(value, dict):
+            try:
+                json.dumps(value)
+                config_params[key] = value
+            except:
+                continue
+        else:
+            config_params[key] = value
+    
+    test_metrics['config'] = config_params
+    
+    # Save to file
+    with open(test_metrics_file, 'w') as f:
+        json.dump(test_metrics, f, indent=4)
+    
+    print(f"Test metrics saved to {test_metrics_file}")
+    
+    print('-' * 20, 'GPU info', '-' * 20)
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"{num_gpus} GPU Available.")
+        for i in range(num_gpus):
+            gpu_info = torch.cuda.get_device_properties(i)
+            print(f"GPU {i}: {gpu_info.name}")
+            print(f"  Total Memory:          {gpu_info.total_memory / 1024**2} MB")
+            print(f"  Multi Processor Count: {gpu_info.multi_processor_count}")
+            print(f"  Compute Capability:    {gpu_info.major}.{gpu_info.minor}")
+    else:
+        print("CUDA is unavailable.")
+    print('-' * 50)
+
+def tune_hyper_parameters(args, opt_space, train_val_data, info, validate_option='holdout_last'):
+    """
+    Tune hyper-parameters.
+
+    :args: argparse.Namespace, arguments
+    :opt_space: dict, search space
+    :train_val_data: tuple, training and validation data
+    :info: dict, information about the dataset
+    :return: argparse.Namespace, arguments
+    """
+    import optuna
+    import optuna.samplers
+    import optuna.trial
+    def objective(trial):
+        config = {}
+        try:
+            opt_space[args.model_type]['training']['n_bins'] = ["int", 2, 2]
+        except:
+            opt_space[args.model_type]['fit']['n_bins'] = ["int", 2, 2]
+        merge_sampled_parameters(
+            config, sample_parameters(trial, opt_space[args.model_type], config)
+        )    
+        if args.model_type == 'xgboost':
+            config['model']['booster'] = 'gbtree'
+            config['model']['n_estimators'] = 4000
+            config['model']['tree_method'] = 'hist'
+            config['fit']["verbose"] = False
+            
+        elif args.model_type == 'catboost':
+            config['model']['n_estimators'] = 4000
+            config['model']['od_pval'] = 0.001
+            config['fit']["logging_level"] = "Silent"
+        
+        elif args.model_type == 'lightgbm':
+            config['model']['n_estimators'] = 4000
+        
+        elif args.model_type == 'RandomForest':
+            config['model']['n_estimators'] = 1000
+            config['model']['n_jobs'] = 64
+        
+        elif args.model_type == 'SGD':
+            config['model']['max_iter'] = 10000
+            config['model']['penalty'] = 'elasticnet'
+            
+        if args.model_type in ['ftt', 'ftt_temporal']:
+            config['model'].setdefault('prenormalization', False)
+            config['model'].setdefault('initialization', 'kaiming')
+            config['model'].setdefault('activation', 'relu')
+            config['model'].setdefault('n_heads', 8)
+            config['model'].setdefault('token_bias', True)
+            config['model'].setdefault('kv_compression', None)
+            config['model'].setdefault('kv_compression_sharing', None)
+            config['model'].setdefault('d_ffn_factor', 2.0)
+            config['model'].setdefault('residual_dropout', 0.0)
+
+        if args.model_type in ['tabr', 'tabr_temporal']:
+            config['model']["num_embeddings"].setdefault('type', 'PLREmbeddings')
+            config['model']["num_embeddings"].setdefault('lite', True)
+            config['model'].setdefault('d_multiplier', 2.0)
+            config['model'].setdefault('encoder_n_blocks', 0)
+            config['model'].setdefault('predictor_n_blocks', 1)
+            config['model'].setdefault('mixer_normalization', 'auto')
+            config['model'].setdefault('dropout1', 0.0)
+            config['model'].setdefault('normalization', "LayerNorm")
+            config['model'].setdefault('activation', "ReLU")
+        
+        if args.model_type in ['tabm', 'tabm_temporal', 'tabm_modulated']:
+            config['model'].setdefault('arch_type', 'tabm')
+            config['model']["num_embeddings"].setdefault('type', 'PLREmbeddings')
+            config['model']["num_embeddings"].setdefault('lite', True)
+            config['model']['backbone'].setdefault('type', 'MLP')
+        
+        if args.model_type in ['mlp_plr', 'mlp_plr_temporal']:
+            config['model']["num_embeddings"].setdefault('type', 'PLREmbeddings')
+            config['model']["num_embeddings"].setdefault('lite', True)
+
+        if args.model_type in ['modernNCA', 'modernNCA_temporal']:
+            config['model']["num_embeddings"].setdefault('type', 'PLREmbeddings')
+            config['model']["num_embeddings"].setdefault('lite', True)
+
+        if args.model_type in ['dcn2', 'dcn2_temporal']:
+            config['model']['stacked'] = False
+
+        if config.get('config_type') == 'trv4':
+            if config['model']['activation'].endswith('glu'):
+                # This adjustment is needed to keep the number of parameters roughly in the
+                # same range as for non-glu activations
+                config['model']['d_ffn_factor'] *= 2 / 3
+
+        trial_configs.append(config)
+        # method.fit(train_val_data, info, train=True, config=config)  
+        # run with this config
+        try:
+            if validate_option.startswith('holdout'):
+                method.fit(train_val_data, info, train=True, config=config)
+                if 'best_epoch' in method.trlog:
+                    trial_best_epoch.append(method.trlog['best_epoch'])
+                return method.trlog['best_res']
+            elif validate_option in ['temporal_cross_validation']:
+                N_trainval, C_trainval, M_trainval, y_trainval, split_idx = train_val_data
+                best_res, best_epoch, train_loss = [], [], []
+                for i in range(len(split_idx)):
+                    train_idx, val_idx = split_idx[i]['train'], split_idx[i]['val']
+                    train_val_data_split = ({"train": N_trainval[train_idx], "val": N_trainval[val_idx]},
+                                            {"train": C_trainval[train_idx], "val": C_trainval[val_idx]},
+                                            {"train": M_trainval[train_idx], "val": M_trainval[val_idx]},
+                                            {"train": y_trainval[train_idx], "val": y_trainval[val_idx]})
+                    method.fit(train_val_data_split, info, train=True, config=config)
+                    best_res.append(method.trlog['best_res'])
+                    if 'best_epoch' in method.trlog:
+                        best_epoch.append(method.trlog['best_epoch'])
+                    if 'train_loss' in method.trlog:
+                        train_loss.append(method.trlog['train_loss'])
+                    print(f"[Cross Validation] Split {i+1}/{len(split_idx)}, Best Epoch {best_epoch[-1]}, Best Result {best_res[-1]}")
+                cross_val_log.append({'best_epoch': best_epoch, 'best_res': best_res, 'train_loss': train_loss})
+                trial_best_epoch.append(int(np.median(best_epoch)))
+                return np.mean(best_res)
+            else:
+                raise ValueError(f'Invalid validate_option: {args.validate_option}')
+        except Exception as e:
+            print(e)
+            trial_best_epoch.append(0)
+            return 1e9 if info['task_type'] == 'regression' else 0.0
+    
+    if osp.exists(osp.join(args.save_path, '{}-tuned.json'.format(args.model_type))) and args.retune == False:
+        with open(osp.join(args.save_path, '{}-tuned.json'.format(args.model_type)), 'rb') as fp:
+            args.config = json.load(fp)
+        if osp.exists(osp.join(args.save_path, 'cross_val_log.json')):
+            with open(osp.join(args.save_path, 'cross_val_log.json'), 'rb') as fp:
+                best_epoch = json.load(fp)['best_epoch']
+        else:
+            best_epoch = 0
+        return args, best_epoch
+    
+    # get data property
+    if info['task_type'] == 'regression':
+        direction = 'minimize'
+        for key in opt_space[args.model_type]['model'].keys():
+            if 'dropout' in key and '?' not in opt_space[args.model_type]['model'][key][0]:
+                opt_space[args.model_type]['model'][key][0] = '?'+ opt_space[args.model_type]['model'][key][0]
+                opt_space[args.model_type]['model'][key].insert(1, 0.0)
+    else:
+        direction = 'maximize'  
+    
+    method = get_method(args.model_type)(args, info['task_type'] == 'regression')      
+
+    trial_configs = []
+    trial_best_epoch = []
+    cross_val_log = []
+    study = optuna.create_study(
+            direction=direction,
+            sampler=optuna.samplers.TPESampler(seed=0),
+        )        
+    study.optimize(
+        objective,
+        **{'n_trials': args.n_trials, 'timeout': args.hpo_timeout},
+        show_progress_bar=True,
+    )
+    # get best configs
+    best_trial_id = study.best_trial.number
+    # update config files        
+    print('Best Hyper-Parameters')
+    print(trial_configs[best_trial_id])
+    args.config = trial_configs[best_trial_id]
+    # best_epoch = trial_best_epoch[best_trial_id]
+    best_epoch = 0
+    with open(osp.join(args.save_path, '{}-tuned.json'.format(args.model_type)), 'w') as fp:
+        json.dump(args.config, fp, sort_keys=True, indent=4)
+    with open(osp.join(args.save_path, 'cross_val_log.json'), 'w') as fp:
+        json.dump({'best_epoch': best_epoch, 'log': cross_val_log}, fp, sort_keys=True, indent=4)
+    torch.cuda.empty_cache()
+    return args, best_epoch
+
+def get_method(model):
+    """
+    Get the method class.
+
+    :model: str, model name
+    :return: class, method class
+    """
+    if model == "mlp":
+        from model.methods.mlp import MLPMethod
+        return MLPMethod
+    elif model == "mlp_modulated":
+        from model.methods.mlp_modulated import MLP_ModulatedMethod
+        return MLP_ModulatedMethod
+    elif model == 'ftt':
+        from model.methods.ftt import FTTMethod
+        return FTTMethod
+    elif model == 'tabr':
+        from model.methods.tabr import TabRMethod
+        return TabRMethod
+    elif model == 'modernNCA':
+        from model.methods.modernNCA import ModernNCAMethod
+        return ModernNCAMethod
+    elif model == 'snn':
+        from model.methods.snn import SNNMethod
+        return SNNMethod
+    elif model == 'dcn2':
+        from model.methods.dcn2 import DCN2Method
+        return DCN2Method
+    elif model == 'mlp_plr':
+        from model.methods.mlp_plr import MLP_PLRMethod
+        return MLP_PLRMethod
+    elif model == 'tabm':
+        from model.methods.tabm import TabMMethod
+        return TabMMethod
+    elif model == 'tabm_modulated':
+        from model.methods.tabm_modulated import TabM_ModulatedMethod
+        return TabM_ModulatedMethod
+    elif model == 'xgboost':
+        from model.classical_methods.xgboost import XGBoostMethod
+        return XGBoostMethod
+    elif model == 'lightgbm':
+        from model.classical_methods.lightgbm import LightGBMMethod
+        return LightGBMMethod
+    elif model == 'RandomForest':
+        from model.classical_methods.randomforest import RandomForestMethod
+        return RandomForestMethod
+    elif model == 'catboost':
+        from model.classical_methods.catboost import CatBoostMethod
+        return CatBoostMethod
+    elif model == 'SGD':
+        from model.classical_methods.sgd import SGDMethod
+        return SGDMethod
+    elif model == 'mlp_temporal':
+        from model.methods.mlp_temporal import MLP_TemporalMethod
+        return MLP_TemporalMethod
+    elif model == 'mlp_plr_temporal':
+        from model.methods.mlp_plr_temporal import MLP_PLR_TemporalMethod
+        return MLP_PLR_TemporalMethod
+    elif model == 'ftt_temporal':
+        from model.methods.ftt_temporal import FTT_TemporalMethod
+        return FTT_TemporalMethod
+    elif model == 'dcn2_temporal':
+        from model.methods.dcn2_temporal import DCN2_TemporalMethod
+        return DCN2_TemporalMethod
+    elif model == 'snn_temporal':
+        from model.methods.snn_temporal import SNN_TemporalMethod
+        return SNN_TemporalMethod
+    elif model == 'tabr_temporal':
+        from model.methods.tabr_temporal import TabR_TemporalMethod
+        return TabR_TemporalMethod
+    elif model == 'modernNCA_temporal':
+        from model.methods.modernNCA_temporal import ModernNCA_TemporalMethod
+        return ModernNCA_TemporalMethod
+    elif model == 'tabm_temporal':
+        from model.methods.tabm_temporal import TabM_TemporalMethod
+        return TabM_TemporalMethod
+    else:
+        raise ValueError(f"Unknown model_type: {model}")

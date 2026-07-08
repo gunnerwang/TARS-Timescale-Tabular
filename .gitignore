@@ -1,0 +1,12 @@
+**/__pycache__/
+*.pyc
+log/
+results/
+results_*/
+data/
+tabred/
+*.pth
+*.ckpt
+*.cpkt
+.idea/
+.DS_Store

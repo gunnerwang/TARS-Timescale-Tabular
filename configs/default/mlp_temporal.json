@@ -1,0 +1,25 @@
+{
+    "mlp_temporal": {
+        "model": {
+            "d_layers": [2048, 256],
+            "dropout": 0.33992609822675907,
+            "implicit_time_dim": 32,
+            "temporal_embeddings": {
+                "d_embedding": 64,
+                "decay_factor": 0.016184547244649884,
+                "periodic_patterns": [24, 168],
+                "feature_fusion": true,
+                "use_cbp": false,
+                "replacement_rate": 1e-4,
+                "maturity_threshold": 100,
+                "cbp_init": "kaiming"
+            }
+        },
+        "training": {
+            "lr": 2.9554803497215155e-05,
+            "weight_decay": 0.0,
+            "n_bins": 2
+        },
+        "general": {}
+    }
+} 
